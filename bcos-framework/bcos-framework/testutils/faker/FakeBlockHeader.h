@@ -216,7 +216,8 @@ inline BlockHeader::Ptr testPBBlockHeader(
     auto hashImpl = _cryptoSuite->hashImpl();
     auto signImpl = _cryptoSuite->signatureImpl();
     auto cryptoSuite = std::make_shared<CryptoSuite>(hashImpl, signImpl, nullptr);
-    int version = 10;
+    // int version = 10;
+    int version = uint32_t(bcos::protocol::BlockVersion::V3_5_VERSION);
     auto parentInfo = fakeParentInfo(hashImpl, 1);
     auto txsRoot = hashImpl->hash((std::string) "txsRoot");
     auto receiptsRoot = hashImpl->hash((std::string) "receiptsRoot");

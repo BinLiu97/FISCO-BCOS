@@ -248,6 +248,7 @@ inline BlocksPtr fakeBlocks(CryptoSuite::Ptr _cryptoSuite, BlockFactory::Ptr _bl
         auto block = fakeAndCheckBlock(_cryptoSuite, _blockFactory, _txsNumBegin + i,
             _receiptsNumBegin + i, i + 1, true, false);
         parentInfos.push_back(parentInfo);
+        block->blockHeader()->setVersion(uint32_t(bcos::protocol::BlockVersion::V3_5_VERSION));
         block->blockHeader()->setNumber(1 + i);
         block->blockHeader()->setParentInfo(parentInfos);
         block->blockHeader()->calculateHash(*_cryptoSuite->hashImpl());

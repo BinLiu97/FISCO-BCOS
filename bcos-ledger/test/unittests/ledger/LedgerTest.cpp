@@ -151,7 +151,7 @@ public:
         BOOST_CHECK(m_ledger != nullptr);
     }
 
-    inline void initFixture(std::string version = bcos::protocol::V3_1_VERSION_STR)
+    inline void initFixture(std::string version = bcos::protocol::V3_5_VERSION_STR)
     {
         m_param = std::make_shared<LedgerConfig>();
         m_param->setBlockNumber(0);
@@ -190,13 +190,13 @@ public:
         m_param->setBlockTxCountLimit(0);
 
         auto result1 =
-            m_ledger->buildGenesisBlock(m_param, 3000000000, "", bcos::protocol::V3_1_VERSION_STR);
+            m_ledger->buildGenesisBlock(m_param, 3000000000, "", bcos::protocol::V3_5_VERSION_STR);
         BOOST_CHECK(result1);
         auto result2 =
-            m_ledger->buildGenesisBlock(m_param, 30, "", bcos::protocol::V3_1_VERSION_STR);
+            m_ledger->buildGenesisBlock(m_param, 30, "", bcos::protocol::V3_5_VERSION_STR);
         BOOST_CHECK(!result2);
         auto result3 =
-            m_ledger->buildGenesisBlock(m_param, 3000000000, "", bcos::protocol::V3_1_VERSION_STR);
+            m_ledger->buildGenesisBlock(m_param, 3000000000, "", bcos::protocol::V3_5_VERSION_STR);
         BOOST_CHECK(result3);
     }
 
@@ -271,7 +271,7 @@ public:
             // write other meta data
             std::promise<bool> prewritePromise;
             m_ledger->asyncPrewriteBlock(
-                m_storage, nullptr, block, [&](Error::Ptr&&) { prewritePromise.set_value(true); });
+                m_storage, txList, block, [&](Error::Ptr&&) { prewritePromise.set_value(true); });
 
             prewritePromise.get_future().get();
         }
@@ -879,6 +879,7 @@ BOOST_AUTO_TEST_CASE(getTransactionByHash)
                     BOOST_CHECK(_proof->at(hash.hex()) != nullptr);
                     auto ret = merkleUtility.verifyMerkleProof(*_proof->at(hash.hex()), hash,
                         m_fakeBlocks->at(i + 1)->blockHeader()->txsRoot());
+                    std::cout << "i = " << i << ", hash = " << hash.hex() << std::endl;
                     BOOST_CHECK(ret);
                 }
 
