@@ -80,43 +80,51 @@ void Ledger::asyncPreStoreBlockTxs(bcos::protocol::TransactionsPtr _blockTxs,
         return;
     }
     auto startT = utcTime();
-    auto blockTxsSize = _blockTxs->size();
-    auto unstoredTxsHash = std::get<1>(txsToSaveResult);
-    auto unstoredTxs = std::get<2>(txsToSaveResult);
+    auto blockVersion = block->version();
+    if (blockVersion >= int32_t(bcos::protocol::BlockVersion::V3_6_VERSION))
+    {
+        storeTransactionsAndReceipts(_blockTxs, block);
+    }
+    else
+    {
+        auto blockTxsSize = _blockTxs->size();
+        auto unstoredTxsHash = std::get<1>(txsToSaveResult);
+        auto unstoredTxs = std::get<2>(txsToSaveResult);
 
-    auto blockNumber = block->blockHeaderConst()->number();
-    auto total = unstoredTxs->size();
-    std::vector<std::string_view> keys(total);
-    std::vector<std::string_view> values(total);
-    for (auto i = 0U; i < unstoredTxs->size(); ++i)
-    {
-        keys[i] = concepts::bytebuffer::toView((*unstoredTxsHash)[i]);
-        values[i] = concepts::bytebuffer::toView((*(*unstoredTxs)[i]));
-    }
-    {
-        // Note: transactions must be submitted serially, because transaction submissions are
-        // transactional, preventing write conflicts
-        RecursiveGuard l(m_mutex);
-        auto error = m_storage->setRows(SYS_HASH_2_TX, keys, values);
-        LEDGER_LOG(INFO) << LOG_DESC("asyncPreStoreBlockTxs: store uncommitted txs")
-                         << LOG_KV("blockNumber", blockNumber)
-                         << LOG_KV("blockTxsSize", blockTxsSize)
-                         << LOG_KV("unStoredTxs", unstoredTxsHash->size())
-                         << LOG_KV("msg", error ? error->errorMessage() : "success")
-                         << LOG_KV("code", error ? error->errorCode() : 0)
-                         << LOG_KV("timeCost", (utcTime() - startT));
-        if (error)
+        auto blockNumber = block->blockHeaderConst()->number();
+        auto total = unstoredTxs->size();
+        std::vector<std::string_view> keys(total);
+        std::vector<std::string_view> values(total);
+        for (auto i = 0U; i < unstoredTxs->size(); ++i)
         {
-            _callback(std::make_unique<Error>(*error));
-            return;
+            keys[i] = concepts::bytebuffer::toView((*unstoredTxsHash)[i]);
+            values[i] = concepts::bytebuffer::toView((*(*unstoredTxs)[i]));
         }
-        // set the flag when store success
-        for (auto const& tx : *_blockTxs)
         {
-            tx->setStoreToBackend(true);
+            // Note: transactions must be submitted serially, because transaction submissions are
+            // transactional, preventing write conflicts
+            RecursiveGuard l(m_mutex);
+            auto error = m_storage->setRows(SYS_HASH_2_TX, keys, values);
+            LEDGER_LOG(INFO) << LOG_DESC("asyncPreStoreBlockTxs: store uncommitted txs")
+                             << LOG_KV("blockNumber", blockNumber)
+                             << LOG_KV("blockTxsSize", blockTxsSize)
+                             << LOG_KV("unStoredTxs", unstoredTxsHash->size())
+                             << LOG_KV("msg", error ? error->errorMessage() : "success")
+                             << LOG_KV("code", error ? error->errorCode() : 0)
+                             << LOG_KV("timeCost", (utcTime() - startT));
+            if (error)
+            {
+                _callback(std::make_unique<Error>(*error));
+                return;
+            }
+            // set the flag when store success
+            for (auto const& tx : *_blockTxs)
+            {
+                tx->setStoreToBackend(true);
+            }
         }
+        _callback(nullptr);
     }
-    _callback(nullptr);
 }
 
 void Ledger::asyncPrewriteBlock(bcos::storage::StorageInterface::Ptr storage,
@@ -157,7 +165,7 @@ void Ledger::asyncPrewriteBlock(bcos::storage::StorageInterface::Ptr storage,
     // if blockVersion >= 3.6, txs will be stored when commit block, not here
     if (blockVersion >= uint32_t(bcos::protocol::BlockVersion::V3_6_VERSION))
     {
-        --TOTAL_CALLBACK;
+        TOTAL_CALLBACK = 7;
     }
 
     auto setRowCallback = [total = std::make_shared<std::atomic<size_t>>(TOTAL_CALLBACK),
@@ -271,7 +279,11 @@ void Ledger::asyncPrewriteBlock(bcos::storage::StorageInterface::Ptr storage,
                             << LOG_KV("blockNumber", blockNumberStr);
     }
 
-    if (blockVersion < uint32_t(bcos::protocol::BlockVersion::V3_6_VERSION))
+    if (blockVersion >= uint32_t(bcos::protocol::BlockVersion::V3_6_VERSION))
+    {
+        LEDGER_LOG(DEBUG) << "Store txs in block during commiting block. ";
+    }
+    else
     {
         bytes transactionsBuffer;
         transactionsBlock->encode(transactionsBuffer);
@@ -397,8 +409,11 @@ bcos::Error::Ptr Ledger::storeTransactionsAndReceipts(
             {
                 auto hash = blockTxs ? blockTxs->at(i)->hash() : block->transaction(i)->hash();
                 txsHash[i] = std::string((char*)hash.data(), hash.size());
-                block->receipt(i)->encode(receipts[i]);
-                receiptsView[i] = std::string_view((char*)receipts[i].data(), receipts[i].size());
+                if (block->receiptsSize() != 0)
+                {
+                    block->receipt(i)->encode(receipts[i]);
+                    receiptsView[i] = std::string_view((char*)receipts[i].data(), receipts[i].size());
+                }
             }
         });
     auto promise = std::make_shared<std::promise<bcos::Error::Ptr>>();
@@ -407,22 +422,23 @@ bcos::Error::Ptr Ledger::storeTransactionsAndReceipts(
         auto err = storage->setRows(SYS_HASH_2_RECEIPT, keys, values);
         promise->set_value(err);
     });
+
     auto txsToStore = std::make_shared<std::vector<bytes>>();
     txsToStore->reserve(txSize);
     auto txsToStoreHash = std::make_shared<HashList>();
     txsToStoreHash->reserve(txSize);
-    std::vector<std::string_view> keys;
-    keys.reserve(txSize);
+    std::vector<std::string_view> txHashes;
+    txHashes.reserve(txSize);
     auto blockNumber = block->blockHeaderConst()->number();
     auto blockVersion = block->blockHeaderConst()->version();
 
     RecursiveGuard guard(m_mutex);
-    size_t unstoredTxs = 0;
+    size_t unstoredTxsCount = 0;
     // TODO: usr block level flag to indicate whether the transactions has been stored
     if (blockVersion >= (uint32_t)BlockVersion::V3_6_VERSION)
     {
-        std::vector<std::string> values(txSize);
-        std::vector<std::string_view> valuesView(txSize);
+        std::vector<std::string> numberAndTxID(txSize);
+        std::vector<std::string_view> numberAndTxIDView(txSize);
         auto transactionsBlock = m_blockFactory->createBlock();
         auto blockNumberStr = boost::lexical_cast<std::string>(blockNumber);
         for (size_t i = 0; i < txSize; i++)
@@ -433,32 +449,25 @@ bcos::Error::Ptr Ledger::storeTransactionsAndReceipts(
                 continue;
             }
 
-            bcos::bytes encodeData;
-            tx->encode(encodeData);
-            bcos::protocol::Transaction::Ptr txData;
-            if (blockNumber == SYS_CONTRACT_DEPLOY_NUMBER)
-            {
-                txData = m_blockFactory->transactionFactory()->createTransaction(
-                    bcos::ref(encodeData), false, false);
-            }
-            else
-            {
-                txData =
-                    m_blockFactory->transactionFactory()->createTransaction(bcos::ref(encodeData));
-            }
-            transactionsBlock->appendTransaction(txData);
+           // bcos::bytes encodeData;
+           // tx->encode(encodeData);
+           // bcos::protocol::Transaction::Ptr transaction;
+           // transaction =
+           //     m_blockFactory->transactionFactory()->createTransaction(bcos::ref(encodeData));
+           // transactionsBlock->appendTransaction(transaction);
+            transactionsBlock->appendTransaction(std::const_pointer_cast<bcos::protocol::Transaction>(tx));
 
             txsToStoreHash->emplace_back(tx->hash());
-            keys.push_back(concepts::bytebuffer::toView((*txsToStoreHash)[unstoredTxs]));
+            txHashes.push_back(concepts::bytebuffer::toView((*txsToStoreHash)[unstoredTxsCount]));
 
-            values[unstoredTxs] =
-                blockNumberStr + "+" + boost::lexical_cast<std::string>(unstoredTxs);
-            valuesView[unstoredTxs] = std::string_view(values[unstoredTxs]);
+            numberAndTxID[unstoredTxsCount] =
+                blockNumberStr + "_" + boost::lexical_cast<std::string>(unstoredTxsCount);
+            numberAndTxIDView[unstoredTxsCount] = std::string_view(numberAndTxID[unstoredTxsCount]);
 
-            ++unstoredTxs;
+            ++unstoredTxsCount;
         }
 
-        if (!keys.empty())
+        if (!txHashes.empty())
         {
             bytes transactionsBuffer;
             transactionsBlock->encode(transactionsBuffer);
@@ -477,7 +486,7 @@ bcos::Error::Ptr Ledger::storeTransactionsAndReceipts(
                     }
                 });
 
-            error = m_storage->setRows(SYS_TXHASH_2_NUMBER, keys, valuesView);
+            error = m_storage->setRows(SYS_TXHASH_2_NUMBER, txHashes, numberAndTxIDView);
             if (error)
             {
                 LEDGER_LOG(ERROR) << LOG_DESC("ledger write transactions failed")
@@ -505,8 +514,8 @@ bcos::Error::Ptr Ledger::storeTransactionsAndReceipts(
     }
     else
     {
-        std::vector<std::string_view> values;
-        values.reserve(txSize);
+        std::vector<std::string_view> txsBytes;
+        txsBytes.reserve(txSize);
         for (size_t i = 0; i < txSize; i++)
         {
             auto tx = blockTxs ? blockTxs->at(i) : block->transaction(i);
@@ -518,15 +527,15 @@ bcos::Error::Ptr Ledger::storeTransactionsAndReceipts(
             tx->encode(encodeData);
             txsToStoreHash->emplace_back(tx->hash());
             txsToStore->emplace_back(std::move(encodeData));
-            keys.push_back(bcos::concepts::bytebuffer::toView((*txsToStoreHash)[unstoredTxs]));
-            values.push_back(bcos::concepts::bytebuffer::toView((*txsToStore)[unstoredTxs]));
-            ++unstoredTxs;
+            txHashes.push_back(bcos::concepts::bytebuffer::toView((*txsToStoreHash)[unstoredTxsCount]));
+            txsBytes.push_back(bcos::concepts::bytebuffer::toView((*txsToStore)[unstoredTxsCount]));
+            ++unstoredTxsCount;
         }
-        if (!keys.empty())
+        if (!txHashes.empty())
         {
             // asyncPreStoreBlockTxs also write txs to DB, needStoreUnsavedTxs is out of lock, so
             // the transactions may be write twice
-            error = m_storage->setRows(SYS_HASH_2_TX, keys, values);
+            error = m_storage->setRows(SYS_HASH_2_TX, txHashes, txsBytes);
             if (error)
             {
                 LEDGER_LOG(ERROR) << LOG_DESC("ledger write transactions failed")
@@ -557,7 +566,7 @@ bcos::Error::Ptr Ledger::storeTransactionsAndReceipts(
 
     LEDGER_LOG(INFO) << LOG_DESC("storeTransactionsAndReceipts finished")
                      << LOG_KV("blockNumber", blockNumber) << LOG_KV("blockTxsSize", txSize)
-                     << LOG_KV("unStoredTxs", unstoredTxs)
+                     << LOG_KV("unStoredTxs", unstoredTxsCount)
                      << LOG_KV("timeCost", (utcTime() - start));
     return nullptr;
 }
@@ -617,8 +626,8 @@ void Ledger::asyncGetBlockDataByNumber(bcos::protocol::BlockNumber _blockNumber,
         ++(*total);
 
         fetchers.push_back([this, _blockNumber, block, finally]() {
-            asyncGetBlockHeader(
-                block, _blockNumber, [finally](Error::Ptr&& error) { finally(std::move(error)); });
+            asyncGetBlockHeader(block, _blockNumber,
+                [block, finally](Error::Ptr&& error) { finally(std::move(error)); });
         });
     }
     if ((_blockFlag & TRANSACTIONS) != 0 || (_blockFlag & TRANSACTIONS_HASH) != 0)
@@ -633,78 +642,213 @@ void Ledger::asyncGetBlockDataByNumber(bcos::protocol::BlockNumber _blockNumber,
         (_blockFlag & TRANSACTIONS_HASH) != 0)
     {
         fetchers.push_back([this, block, _blockNumber, finally, _blockFlag]() {
-            asyncGetBlockTransactionHashes(_blockNumber, [this, _blockFlag, block, finally](
-                                                             Error::Ptr&& error,
-                                                             std::vector<std::string>&& hashes) {
-                if (error)
-                {
-                    // if flag has both TRANSACTIONS and RECEIPTS, then the finally need to be
-                    // called twice, so has below if logic
-                    if ((_blockFlag & TRANSACTIONS) != 0 || (_blockFlag & TRANSACTIONS_HASH) != 0)
-                    {
-                        finally(std::move(error));
-                    }
-                    if ((_blockFlag & RECEIPTS) != 0)
-                    {
-                        finally(std::move(error));
-                    }
-                    return;
-                }
-
-                LEDGER_LOG(TRACE) << "Get transactions hash list success, size:" << hashes.size();
-
-                auto hashesPtr = std::make_shared<std::vector<std::string>>(std::move(hashes));
+            LEDGER_LOG(INFO) << "GetBlockDataByNumber" << LOG_KV("blockNumber", _blockNumber)
+                             << LOG_KV("blockVersion", block->blockHeader()->version());
+            if (block->blockHeader()->version() >= (uint32_t)BlockVersion::V3_6_VERSION)
+            {
                 if ((_blockFlag & TRANSACTIONS) != 0)
                 {
-                    asyncBatchGetTransactions(
-                        hashesPtr, [block, finally](Error::Ptr&& error,
-                                       std::vector<protocol::Transaction::Ptr>&& transactions) {
-                            if (error)
+                    m_storage->asyncOpenTable(
+                        SYS_NUMBER_2_BLOCK_TXS, [this, block, _blockNumber, finally](
+                                                    auto&& error, std::optional<Table>&& table) {
+                            auto validError = checkTableValid(std::forward<decltype(error)>(error),
+                                table, SYS_NUMBER_2_BLOCK_TXS);
+                            if (validError)
                             {
-                                LEDGER_LOG(DEBUG)
-                                    << LOG_DESC(
-                                           "asyncGetBlockDataByNumber batch getTransactions failed")
-                                    << LOG_KV("code", error->errorCode())
-                                    << LOG_KV("msg", error->errorMessage());
+                                finally(std::move(validError));
+                                return;
                             }
-                            for (auto& it : transactions)
-                            {
-                                block->appendTransaction(it);
-                            }
-                            finally(std::move(error));
+
+                            std::string blockNumberStr =
+                                boost::lexical_cast<std::string>(_blockNumber);
+
+                            table->asyncGetRow(blockNumberStr,
+                                [this, block, finally](auto&& error, std::optional<Entry>&& entry) {
+                                    if (error)
+                                    {
+                                        LEDGER_LOG(DEBUG) << LOG_DESC(
+                                                                 "asyncGetBlockDataByNumber batch "
+                                                                 "getTransactions failed")
+                                                          << LOG_KV("code", error->errorCode())
+                                                          << LOG_KV("msg", error->errorMessage());
+                                        finally(nullptr);
+                                        return;
+                                    }
+                                    if (!entry)
+                                    {
+                                        LEDGER_LOG(DEBUG)
+                                            << LOG_DESC("asyncGetBlockDataByNumber empty block!");
+                                        finally(nullptr);
+                                        return;
+                                    }
+
+                                    auto header = block->blockHeader();
+                                    // bytes headerBuffer;
+                                    // header->encode(headerBuffer);
+                                    //
+                                    // auto blockHeader =
+                                    //     m_blockFactory->blockHeaderFactory()->createBlockHeader(
+                                    //         headerBuffer);
+
+                                    std::string_view value = entry->getField(0);
+                                    block->decode(bcos::bytesConstRef(
+                                                      (bcos::byte*)value.data(), value.size()),
+                                        true, true);
+                                    // block->setBlockHeader(blockHeader);
+                                    block->setBlockHeader(header);
+
+                                    finally(nullptr);
+                                });
                         });
                 }
                 if ((_blockFlag & RECEIPTS) != 0)
                 {
-                    asyncBatchGetReceipts(
-                        hashesPtr, [block, finally](Error::Ptr&& error,
-                                       std::vector<protocol::TransactionReceipt::Ptr>&& receipts) {
-                            for (auto& it : receipts)
+                    asyncGetBlockTransactionHashes(
+                        _blockNumber, [this, _blockFlag, block, finally](
+                                          Error::Ptr&& error, std::vector<std::string>&& hashes) {
+                            auto hashesPtr =
+                                std::make_shared<std::vector<std::string>>(std::move(hashes));
+                            if (error)
                             {
-                                block->appendReceipt(it);
+                                // if flag has both TRANSACTIONS and RECEIPTS, then the finally need
+                                // to be called twice, so has below if logic
+                                if ((_blockFlag & TRANSACTIONS) != 0 ||
+                                    (_blockFlag & TRANSACTIONS_HASH) != 0)
+                                {
+                                    finally(std::move(error));
+                                }
+                                if ((_blockFlag & RECEIPTS) != 0)
+                                {
+                                    finally(std::move(error));
+                                }
+                                return;
                             }
-                            finally(std::move(error));
+                            asyncBatchGetReceipts(hashesPtr,
+                                [block, finally](Error::Ptr&& error,
+                                    std::vector<protocol::TransactionReceipt::Ptr>&& receipts) {
+                                    for (auto& it : receipts)
+                                    {
+                                        block->appendReceipt(it);
+                                    }
+                                    finally(std::move(error));
+                                });
                         });
                 }
                 if ((_blockFlag & TRANSACTIONS_HASH) != 0)
                 {
-                    for (auto& hash : *hashesPtr)
-                    {
-                        auto txMeta = m_blockFactory->createTransactionMetaData();
-                        txMeta->setHash(bcos::crypto::HashType(
-                            hash, bcos::crypto::HashType::StringDataType::FromBinary));
-                        block->appendTransactionMetaData(std::move(txMeta));
-                    }
-                    finally(nullptr);
+                    asyncGetBlockTransactionHashes(
+                        _blockNumber, [this, _blockFlag, block, finally](
+                                          Error::Ptr&& error, std::vector<std::string>&& hashes) {
+                            auto hashesPtr =
+                                std::make_shared<std::vector<std::string>>(std::move(hashes));
+                            if (error)
+                            {
+                                // if flag has both TRANSACTIONS and RECEIPTS, then the finally need
+                                // to be called twice, so has below if logic
+                                if ((_blockFlag & TRANSACTIONS) != 0 ||
+                                    (_blockFlag & TRANSACTIONS_HASH) != 0)
+                                {
+                                    finally(std::move(error));
+                                }
+                                if ((_blockFlag & RECEIPTS) != 0)
+                                {
+                                    finally(std::move(error));
+                                }
+                                return;
+                            }
+                            for (auto& hash : *hashesPtr)
+                            {
+                                auto txMeta = m_blockFactory->createTransactionMetaData();
+                                txMeta->setHash(bcos::crypto::HashType(
+                                    hash, bcos::crypto::HashType::StringDataType::FromBinary));
+                                block->appendTransactionMetaData(std::move(txMeta));
+                            }
+                            finally(nullptr);
+                        });
                 }
-            });
+            }
+            else
+            {
+                asyncGetBlockTransactionHashes(
+                    _blockNumber, [this, _blockFlag, block, finally](
+                                      Error::Ptr&& error, std::vector<std::string>&& hashes) {
+                        if (error)
+                        {
+                            // if flag has both TRANSACTIONS and RECEIPTS, then the finally need
+                            // to be called twice, so has below if logic
+                            if ((_blockFlag & TRANSACTIONS) != 0 ||
+                                (_blockFlag & TRANSACTIONS_HASH) != 0)
+                            {
+                                finally(std::move(error));
+                            }
+                            if ((_blockFlag & RECEIPTS) != 0)
+                            {
+                                finally(std::move(error));
+                            }
+                            return;
+                        }
+
+                        LEDGER_LOG(TRACE)
+                            << "Get transactions hash list success, size:" << hashes.size();
+
+                        auto hashesPtr =
+                            std::make_shared<std::vector<std::string>>(std::move(hashes));
+                        if ((_blockFlag & TRANSACTIONS) != 0)
+                        {
+                            asyncBatchGetTransactions(hashesPtr,
+                                [block, finally](Error::Ptr&& error,
+                                    std::vector<protocol::Transaction::Ptr>&& transactions) {
+                                    if (error)
+                                    {
+                                        LEDGER_LOG(DEBUG) << LOG_DESC(
+                                                                 "asyncGetBlockDataByNumber batch "
+                                                                 "getTransactions failed")
+                                                          << LOG_KV("code", error->errorCode())
+                                                          << LOG_KV("msg", error->errorMessage());
+                                    }
+                                    for (auto& it : transactions)
+                                    {
+                                        block->appendTransaction(it);
+                                    }
+                                    finally(std::move(error));
+                                });
+                        }
+                        if ((_blockFlag & RECEIPTS) != 0)
+                        {
+                            asyncBatchGetReceipts(hashesPtr,
+                                [block, finally](Error::Ptr&& error,
+                                    std::vector<protocol::TransactionReceipt::Ptr>&& receipts) {
+                                    for (auto& it : receipts)
+                                    {
+                                        block->appendReceipt(it);
+                                    }
+                                    finally(std::move(error));
+                                });
+                        }
+                        if ((_blockFlag & TRANSACTIONS_HASH) != 0)
+                        {
+                            for (auto& hash : *hashesPtr)
+                            {
+                                auto txMeta = m_blockFactory->createTransactionMetaData();
+                                txMeta->setHash(bcos::crypto::HashType(
+                                    hash, bcos::crypto::HashType::StringDataType::FromBinary));
+                                block->appendTransactionMetaData(std::move(txMeta));
+                            }
+                            finally(nullptr);
+                        }
+                    });
+            }
         });
     }
 
+    auto getBlockTime = utcTime();
     for (auto& it : fetchers)
     {
         it();
     }
+    LEDGER_LOG(INFO) << LOG_DESC("+++++++getBlockByNumber finished+++++++++")
+                     << LOG_KV("blockNumber", _blockNumber)
+                     << LOG_KV("timeCost", (utcTime() - getBlockTime));
 }
 
 void Ledger::asyncGetBlockNumber(
@@ -1321,8 +1465,63 @@ void Ledger::asyncGetBlockHeader(bcos::protocol::Block::Ptr block,
 void Ledger::asyncGetBlockTransactionHashes(bcos::protocol::BlockNumber blockNumber,
     std::function<void(Error::Ptr&&, std::vector<std::string>&&)> callback)
 {
-    m_storage->asyncOpenTable(SYS_NUMBER_2_TXS,
-        [this, blockNumber, callback](auto&& error, std::optional<Table>&& table) {
+    auto block = m_blockFactory->createBlock();
+    std::promise<Error::Ptr> promise;
+    asyncGetBlockHeader(
+        block, blockNumber, [&promise](auto&& error) { promise.set_value(std::move(error)); });
+    auto error = promise.get_future().get();
+    if (error)
+    {
+        callback(std::move(error), std::vector<std::string>());
+        return;
+    }
+    if (block->blockHeaderConst()->version() >= (uint32_t)BlockVersion::V3_6_VERSION)
+    {
+        m_storage->asyncOpenTable(SYS_NUMBER_2_BLOCK_TXS,
+            [this, block, blockNumber, callback](auto&& error, std::optional<Table>&& table) {
+                auto validError = checkTableValid(
+                    std::forward<decltype(error)>(error), table, SYS_NUMBER_2_BLOCK_TXS);
+                if (validError)
+                {
+                    callback(std::move(error), std::vector<std::string>());
+                    return;
+                }
+                std::string blockNumberStr = boost::lexical_cast<std::string>(blockNumber);
+
+                table->asyncGetRow(blockNumberStr,
+                    [this, block, callback](auto&& error, std::optional<Entry>&& entry) {
+                        if (error)
+                        {
+                            callback(BCOS_ERROR_WITH_PREV_PTR(LedgerError::GetStorageError,
+                                         "Batch get transaction failed ", *error),
+                                std::vector<std::string>());
+                            return;
+                        }
+                        if (!entry)
+                        {
+                            callback(nullptr, std::vector<std::string>());
+                            return;
+                        }
+
+                        std::string_view value = entry->getField(0);
+                        block->decode(bcos::bytesConstRef((bcos::byte*)value.data(), value.size()),
+                            true, true);
+
+                        std::vector<std::string> hashList(block->transactionsSize());
+                        for (size_t i = 0; i < block->transactionsSize(); ++i)
+                        {
+                            auto hash = block->transaction(i)->hash();
+                            hashList[i].assign(hash.begin(), hash.end());
+                        }
+
+                        callback(nullptr, std::move(hashList));
+                    });
+            });
+    }
+    else
+    {
+        m_storage->asyncOpenTable(SYS_NUMBER_2_TXS, [this, blockNumber, callback](auto&& error,
+                                                        std::optional<Table>&& table) {
             auto validError = checkTableValid(std::move(error), table, SYS_NUMBER_2_BLOCK_HEADER);
             if (validError)
             {
@@ -1355,79 +1554,202 @@ void Ledger::asyncGetBlockTransactionHashes(bcos::protocol::BlockNumber blockNum
                     callback(nullptr, std::move(hashList));
                 });
         });
+    }
+}
+
+void Ledger::asyncGetTransactionByHash(
+    std::string_view hash, std::function<void(Error::Ptr&&, protocol::Transaction::Ptr&&)> callback)
+{
+    m_storage->asyncOpenTable(SYS_TXHASH_2_NUMBER, [this, hash, callback](
+                                                       auto&& error, std::optional<Table>&& table) {
+        auto validError =
+            checkTableValid(std::forward<decltype(error)>(error), table, SYS_TXHASH_2_NUMBER);
+        if (validError)
+        {
+            callback(std::move(validError), nullptr);
+            return;
+        }
+
+        table->asyncGetRow(hash, [this, hash, callback](
+                                     auto&& error, std::optional<Entry>&& entry) {
+            if (error)
+            {
+                LEDGER_LOG(DEBUG) << "Batch get transaction failed in SYS_TXHASH_2_NUMBER"
+                                  << boost::diagnostic_information(*error);
+                callback(nullptr, nullptr);
+                return;
+            }
+
+            if (entry.has_value() == 0)
+            {
+                LEDGER_LOG(DEBUG) << "Get transaction failed in SYS_TXHASH_2_NUMBER: "
+                                  << LOG_KV("txHash", toHex(hash));
+                callback(nullptr, nullptr);
+                return;
+            }
+
+            auto field = std::string(entry->getField(0));
+            auto pos = field.find("_");
+            if (pos == std::string::npos)
+            {
+                LEDGER_LOG(INFO) << LOG_DESC("getRow SYS_TXHASH_2_NUMBER")
+                                 << LOG_DESC(", get wrong");
+                return;
+            }
+            auto blockNumber = boost::lexical_cast<int64_t>(field.substr(0, pos));
+            auto txIndex = boost::lexical_cast<int64_t>(field.substr(pos + 1));
+
+            m_storage->asyncOpenTable(SYS_NUMBER_2_BLOCK_TXS, [this, blockNumber, txIndex,
+                                                                  callback](auto&& error,
+                                                                  std::optional<Table>&& table) {
+                if (error)
+                {
+                    LEDGER_LOG(INFO)
+                        << "Batch number get block transactions failed in SYS_NUMBER_2_BLOCK_TXS "
+                        << boost::diagnostic_information(*error);
+                    callback(BCOS_ERROR_WITH_PREV_PTR(LedgerError::GetStorageError,
+                                 "Batch number get block transactions failed ", *error),
+                        nullptr);
+                    return;
+                }
+                table->asyncGetRow(std::to_string(blockNumber), [this, blockNumber, txIndex,
+                                                                    callback](auto&& error,
+                                                                    std::optional<Entry>&& entry) {
+                    if (error)
+                    {
+                        LEDGER_LOG(INFO)
+                            << "Get transaction by hash failed in SYS_NUMBER_2_BLOCK_TXS "
+                            << boost::diagnostic_information(*error);
+                        callback(BCOS_ERROR_WITH_PREV_PTR(LedgerError::GetStorageError,
+                                     "Get transaction by hash failed ", *error),
+                            nullptr);
+                        return;
+                    }
+
+                    if (!entry.has_value())
+                    {
+                        LEDGER_LOG(INFO)
+                            << "Get block failed: " << LOG_KV("blockNumber", blockNumber);
+                        callback(BCOS_ERROR_WITH_PREV_PTR(LedgerError::GetStorageError,
+                                     "Get transaction by hash failed ", *error),
+                            nullptr);
+                        return;
+                    }
+                    else
+                    {
+                        auto block = m_blockFactory->createBlock();
+                        std::string_view value = entry->getField(0);
+                        block->decode(bcos::bytesConstRef((bcos::byte*)value.data(), value.size()),
+                            true, true);
+                        auto blockTransaction = block->transaction(txIndex);
+                        // bytes transactionsBuffer;
+                        // blockTransaction->encode(transactionsBuffer);
+
+                        // auto transaction = m_blockFactory->transactionFactory()->createTransaction(
+                        //     bcos::ref(transactionsBuffer));
+
+                        callback(
+                            nullptr, std::move(std::const_pointer_cast<bcos::protocol::Transaction>(
+                                         blockTransaction)));
+                    }
+                });
+            });
+        });
+    });
 }
 
 void Ledger::asyncBatchGetTransactions(std::shared_ptr<std::vector<std::string>> hashes,
     std::function<void(Error::Ptr&&, std::vector<protocol::Transaction::Ptr>&&)> callback)
 {
-    m_storage->asyncOpenTable(
-        SYS_HASH_2_TX, [this, hashes, callback](auto&& error, std::optional<Table>&& table) {
-            auto validError =
-                checkTableValid(std::forward<decltype(error)>(error), table, SYS_HASH_2_TX);
-            if (validError)
+    LEDGER_LOG(DEBUG) << "asyncBatchGetTransactions ";
+
+    std::vector<std::string_view> hashesView;
+    hashesView.reserve(hashes->size());
+    for (auto& hash : *hashes)
+    {
+        hashesView.push_back(hash);
+    }
+
+    std::vector<protocol::Transaction::Ptr> transactions;
+    transactions.reserve(hashes->size());
+    size_t count = 0;
+
+    for (size_t i = 0; i < hashes->size(); ++i)
+    {
+        auto hashView = hashesView[i];
+        asyncGetTransactionByHash(hashesView[i], [this, &i, &count, &transactions, &hashView,
+                                                     callback](auto&& error,
+                                                     protocol::Transaction::Ptr transaction) {
+            if (error)
             {
-                callback(std::move(validError), std::vector<protocol::Transaction::Ptr>());
+                LEDGER_LOG(DEBUG) << "Batch get transaction failed in SYS_NUMBER_2_BLOCK_TXS"
+                                  << boost::diagnostic_information(*error);
+            }
+
+            if (transaction != nullptr)
+            {
+                transactions.push_back(std::move(transaction));
+                ++count;
                 return;
             }
 
-            std::vector<std::string_view> hashesView;
-            hashesView.reserve(hashes->size());
-            for (auto& hash : *hashes)
-            {
-                hashesView.push_back(hash);
-            }
-
-            table->asyncGetRows(hashesView, [this, hashes, callback](auto&& error,
-                                                std::vector<std::optional<Entry>>&& entries) {
-                if (error)
+            m_storage->asyncOpenTable(SYS_HASH_2_TX, [this, &i, &count, &transactions, hashView,
+                                                         callback](auto&& error,
+                                                         std::optional<Table>&& table) {
+                auto validError =
+                    checkTableValid(std::forward<decltype(error)>(error), table, SYS_HASH_2_TX);
+                if (validError)
                 {
-                    LEDGER_LOG(DEBUG)
-                        << "Batch get transaction failed " << boost::diagnostic_information(*error);
-                    callback(BCOS_ERROR_WITH_PREV_PTR(LedgerError::GetStorageError,
-                                 "Batch get transaction failed ", *error),
-                        std::vector<protocol::Transaction::Ptr>());
-
+                    callback(std::move(validError), std::vector<protocol::Transaction::Ptr>());
                     return;
                 }
 
-                std::vector<protocol::Transaction::Ptr> transactions;
-                size_t i = 0;
-                for (auto& entry : entries)
-                {
+                table->asyncGetRow(hashView, [this, &i, &transactions, hashView, &count, callback](
+                                                 auto&& error, std::optional<Entry>&& entry) {
+                    if (error)
+                    {
+                        LEDGER_LOG(DEBUG) << "Batch get transaction failed "
+                                          << boost::diagnostic_information(*error);
+                        callback(BCOS_ERROR_WITH_PREV_PTR(LedgerError::GetStorageError,
+                                     "Batch get transaction failed ", *error),
+                            std::vector<protocol::Transaction::Ptr>());
+
+                        return;
+                    }
+
                     if (!entry.has_value())
                     {
-                        LEDGER_LOG(TRACE)
-                            << "Get transaction failed: " << LOG_KV("txHash", toHex((*hashes)[i]));
+                        LEDGER_LOG(DEBUG)
+                            << "Get transaction failed: " << LOG_KV("txHash", toHex(hashView));
                     }
                     else
                     {
                         auto field = entry->getField(0);
                         auto transaction = m_blockFactory->transactionFactory()->createTransaction(
-                            bcos::bytesConstRef((bcos::byte*)field.data(), field.size()), false,
-                            false);
+                            bcos::bytesConstRef((bcos::byte*)field.data(), field.size()));
                         transactions.push_back(std::move(transaction));
+                        ++count;
                     }
-
-                    ++i;
-                }
-                if (transactions.size() != hashes->size())
-                {
-                    LEDGER_LOG(DEBUG)
-                        << "Batch get transaction failed, transactions size not match hashesSize"
-                        << LOG_KV("txsSize", transactions.size())
-                        << LOG_KV("hashesSize", hashes->size());
-                    callback(BCOS_ERROR_PTR(LedgerError::CollectAsyncCallbackError,
-                                 "Batch get transaction failed, transactions size not match "
-                                 "hashesSize, txsSize: " +
-                                     std::to_string(transactions.size()) +
-                                     ", hashesSize: " + std::to_string(hashes->size())),
-                        std::move(transactions));
-                    return;
-                }
-
-                callback(nullptr, std::move(transactions));
+                });
             });
         });
+    }
+
+    if (count != hashes->size())
+    {
+        LEDGER_LOG(INFO) << "Batch get transaction failed, transactions size not match hashesSize"
+                         << LOG_KV("txsSize", transactions.size())
+                         << LOG_KV("hashesSize", hashes->size());
+        callback(BCOS_ERROR_PTR(LedgerError::CollectAsyncCallbackError,
+                     "Batch get transaction failed, transactions size not match "
+                     "hashesSize, txsSize: " +
+                         std::to_string(transactions.size()) +
+                         ", hashesSize: " + std::to_string(hashes->size())),
+            std::move(transactions));
+        return;
+    }
+
+    callback(nullptr, std::move(transactions));
 }
 
 void Ledger::asyncBatchGetReceipts(std::shared_ptr<std::vector<std::string>> hashes,
@@ -1553,6 +1875,7 @@ void Ledger::getTxProof(
                 return;
             }
             auto blockNumber = _receipt->blockNumber();
+            auto startTime = utcTime();
             asyncGetBlockTransactionHashes(
                 blockNumber, [this, _onGetProof, _txHash = std::move(_txHash), blockNumber](
                                  Error::Ptr&& _error, std::vector<std::string>&& _hashList) {
@@ -1592,13 +1915,10 @@ void Ledger::getTxProof(
                             merkle.template generateMerkleProof(
                                 hashesRange, merkleTree, _txHash, *merkleProofPtr);
 
-                            LEDGER_LOG(TRACE)
-                                << LOG_BADGE("getTxProof") << LOG_DESC("get merkle proof success")
-                                << LOG_KV("txHash", _txHash.hex());
-
                             _onGetProof(nullptr, std::move(merkleProofPtr));
                         });
                 });
+            LEDGER_LOG(ERROR) << LOG_DESC("getTxProof time cast") << LOG_KV("time", utcTime()-startTime);
         });
 }
 
@@ -1607,6 +1927,7 @@ void Ledger::getReceiptProof(protocol::TransactionReceipt::Ptr _receipt,
 {
     // receipt->number number->txs txs->receipts
     auto blockNumber = _receipt->blockNumber();
+    auto startTime = utcTime();
     asyncGetBlockTransactionHashes(blockNumber,
         [this, _onGetProof = std::move(_onGetProof), receiptHash = _receipt->hash(), blockNumber](
             Error::Ptr&& _error, std::vector<std::string>&& _hashList) {
@@ -1646,6 +1967,7 @@ void Ledger::getReceiptProof(protocol::TransactionReceipt::Ptr _receipt,
                     _onGetProof(nullptr, std::move(merkleProofPtr));
                 });
         });
+    LEDGER_LOG(ERROR) << LOG_DESC("getReceiptProof time cast") << LOG_KV("time", utcTime()-startTime);
 }
 
 // sync method, to be split
@@ -1777,7 +2099,9 @@ bool Ledger::buildGenesisBlock(
     {
         std::vector<std::string_view> moreTables{
             SYS_CODE_BINARY, SYS_VALUE,
-            SYS_CONTRACT_ABI, SYS_VALUE
+            SYS_CONTRACT_ABI, SYS_VALUE,
+            SYS_TXHASH_2_NUMBER, SYS_VALUE,
+            SYS_NUMBER_2_BLOCK_TXS, SYS_VALUE,
         };
 
         for (auto v : moreTables)
@@ -1826,6 +2150,11 @@ bool Ledger::buildGenesisBlock(
 
     auto block = m_blockFactory->createBlock();
     block->setBlockHeader(header);
+
+    if (versionNumber >= protocol::BlockVersion::V3_6_VERSION)
+    {
+        storeTransactionsAndReceipts(nullptr, block);
+    }
 
     std::promise<Error::Ptr> genesisBlockPromise;
     asyncPrewriteBlock(m_storage, nullptr, block, [&genesisBlockPromise](Error::Ptr&& error) {

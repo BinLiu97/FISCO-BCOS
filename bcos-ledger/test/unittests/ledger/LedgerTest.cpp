@@ -151,7 +151,7 @@ public:
         BOOST_CHECK(m_ledger != nullptr);
     }
 
-    inline void initFixture(std::string version = bcos::protocol::V3_1_VERSION_STR)
+    inline void initFixture(std::string version = bcos::protocol::V3_6_VERSION_STR)
     {
         m_param = std::make_shared<LedgerConfig>();
         m_param->setBlockNumber(0);
@@ -284,7 +284,6 @@ public:
             BOOST_CHECK_EQUAL(f1.get(), true);
 
             auto& block = m_fakeBlocks->at(i);
-
             // write other meta data
             std::promise<bool> prewritePromise;
             m_ledger->asyncPrewriteBlock(
@@ -320,6 +319,8 @@ public:
             //     });
 
             // BOOST_CHECK_EQUAL(f3.get(), true);
+
+            m_ledger->storeTransactionsAndReceipts(nullptr,m_fakeBlocks->at(i));
 
             std::promise<bool> p3;
             m_ledger->asyncPrewriteBlock(
@@ -1276,6 +1277,7 @@ BOOST_AUTO_TEST_CASE(testSyncBlock)
     auto block = m_blockFactory->createBlock();
     auto blockHeader = m_blockFactory->blockHeaderFactory()->createBlockHeader();
     blockHeader->setNumber(100);
+    blockHeader->setVersion(uint32_t(bcos::protocol::BlockVersion::V3_6_VERSION));
     blockHeader->calculateHash(*m_blockFactory->cryptoSuite()->hashImpl());
 
     block->setBlockHeader(blockHeader);

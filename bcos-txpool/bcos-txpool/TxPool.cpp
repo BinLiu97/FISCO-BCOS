@@ -252,6 +252,7 @@ void TxPool::asyncVerifyBlock(PublicPtr _generatedNodeID, bytesConstRef const& _
     std::function<void(Error::Ptr, bool)> _onVerifyFinished)
 {
     auto block = m_config->blockFactory()->createBlock(_block);
+    block->setVersion(int32_t(bcos::protocol::BlockVersion::V3_6_VERSION));
     auto blockHeader = block->blockHeader();
     TXPOOL_LOG(INFO) << LOG_DESC("begin asyncVerifyBlock")
                      << LOG_KV("consNum", blockHeader ? blockHeader->number() : -1)
@@ -319,11 +320,11 @@ void TxPool::asyncVerifyBlock(PublicPtr _generatedNodeID, bytesConstRef const& _
                     // m_txsPreStore
 
                     // Note: To avoid incomplete transactions in the block, the block is only stored once during commit
-                    // if (!verifyError && verifyRet && block && block->blockHeader())
-                    // {
-                    //     txpool->m_txsPreStore->enqueue(
-                    //         [txpool, block]() { txpool->storeVerifiedBlock(block); });
-                    // }
+                    if (!verifyError && verifyRet && block && block->blockHeader())
+                    {
+                        txpool->m_txsPreStore->enqueue(
+                            [txpool, block]() { txpool->storeVerifiedBlock(block); });
+                    }
                 };
 
             if (missedTxs->empty())
@@ -644,23 +645,39 @@ void TxPool::storeVerifiedBlock(bcos::protocol::Block::Ptr _block)
             {
                 return;
             }
-            txpool->m_config->ledger()->asyncPreStoreBlockTxs(
-                std::move(_txs), _block, [startT, blockHeader](Error::UniquePtr&& _error) {
-                    if (_error)
-                    {
-                        TXPOOL_LOG(WARNING)
-                            << LOG_DESC("storeVerifiedBlock: asyncPreStoreBlockTxs failed")
-                            << LOG_KV("consNum", blockHeader->number())
-                            << LOG_KV("hash", blockHeader->hash().abridged())
-                            << LOG_KV("msg", _error->errorMessage())
-                            << LOG_KV("code", _error->errorCode());
-                        return;
-                    }
-                    TXPOOL_LOG(INFO) << LOG_DESC("storeVerifiedBlock success")
-                                     << LOG_KV("consNum", blockHeader->number())
-                                     << LOG_KV("hash", blockHeader->hash().abridged())
-                                     << LOG_KV("timecost", (utcTime() - startT));
-                });
+            auto blockVersion = blockHeader->version();
+            TXPOOL_LOG(WARNING)
+                << LOG_DESC("storeVerifiedBlock: version")
+                << LOG_KV("3.6 version", uint32_t(bcos::protocol::BlockVersion::V3_6_VERSION))
+                << LOG_KV("version", blockVersion);
+//            if(blockVersion >= uint32_t(bcos::protocol::BlockVersion::V3_6_VERSION))
+//            {
+//                TXPOOL_LOG(WARNING)
+//                    << LOG_DESC("storeVerifiedBlock: new version")
+//                    << LOG_KV("consNum", blockHeader->number())
+//                    << LOG_KV("version", blockVersion);
+//                txpool->m_config->ledger()->storeTransactionsAndReceipts(std::move(_txs), _block);
+//            }
+//            else
+            {
+                txpool->m_config->ledger()->asyncPreStoreBlockTxs(
+                    std::move(_txs), _block, [startT, blockHeader](Error::UniquePtr&& _error) {
+                        if (_error)
+                        {
+                            TXPOOL_LOG(WARNING)
+                                << LOG_DESC("storeVerifiedBlock: asyncPreStoreBlockTxs failed")
+                                << LOG_KV("consNum", blockHeader->number())
+                                << LOG_KV("hash", blockHeader->hash().abridged())
+                                << LOG_KV("msg", _error->errorMessage())
+                                << LOG_KV("code", _error->errorCode());
+                            return;
+                        }
+                        TXPOOL_LOG(INFO) << LOG_DESC("storeVerifiedBlock success")
+                                         << LOG_KV("consNum", blockHeader->number())
+                                         << LOG_KV("hash", blockHeader->hash().abridged())
+                                         << LOG_KV("timecost", (utcTime() - startT));
+                    });
+            }
         });
 }
 void bcos::txpool::TxPool::notifyConnectedNodes(

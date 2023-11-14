@@ -491,11 +491,12 @@ void BlockExecutive::asyncCommit(std::function<void(Error::UniquePtr)> callback)
     auto stateStorage = std::make_shared<storage::StateStorage>(m_scheduler->m_storage);
 
     m_currentTimePoint = std::chrono::system_clock::now();
+    auto startTime = utcTime();
     SCHEDULER_LOG(DEBUG) << BLOCK_NUMBER(number()) << LOG_DESC("BlockExecutive commit block");
 
     m_scheduler->m_ledger->asyncPrewriteBlock(
         stateStorage, m_blockTxs, m_block,
-        [this, stateStorage, callback = std::move(callback)](Error::Ptr&& error) mutable {
+        [this, stateStorage, callback = std::move(callback), startTime](Error::Ptr&& error) mutable {
             if (error)
             {
                 SCHEDULER_LOG(ERROR) << "Prewrite block error!" << error->errorMessage();
@@ -510,6 +511,8 @@ void BlockExecutive::asyncCommit(std::function<void(Error::UniquePtr)> callback)
 
                 return;
             }
+            auto time = utcTime() - startTime;
+            std::cout << "asyncPrewriteBlock timeCast = " << time << "ms" << std::endl;
 
             auto status = std::make_shared<CommitStatus>();
             // self + ledger(txs receipts) + executors = 1 + 1 + executors
@@ -550,7 +553,8 @@ void BlockExecutive::asyncCommit(std::function<void(Error::UniquePtr)> callback)
                     return;
                 }
 
-                SCHEDULER_LOG(DEBUG) << BLOCK_NUMBER(number()) << "batchCommitBlock begin";
+                SCHEDULER_LOG(INFO) << BLOCK_NUMBER(number()) << "batchCommitBlock begin";
+                m_batchBlockCommitTimePoint = utcTime();
                 batchBlockCommit(status.startTS, [this, callback](Error::UniquePtr&& error) {
                     if (error)
                     {
@@ -572,11 +576,14 @@ void BlockExecutive::asyncCommit(std::function<void(Error::UniquePtr)> callback)
 
                     m_commitElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::system_clock::now() - m_currentTimePoint);
-                    SCHEDULER_LOG(DEBUG)
+                    SCHEDULER_LOG(INFO)
                         << BLOCK_NUMBER(number()) << "CommitBlock: "
                         << "success, execute elapsed: " << m_executeElapsed.count()
                         << "ms hash elapsed: " << m_hashElapsed.count()
                         << "ms commit elapsed: " << m_commitElapsed.count() << "ms";
+
+                    auto time = utcTime() - m_batchBlockCommitTimePoint;
+                    std::cout << "batchBlockCommit castTime = " << time << std::endl;
 
                     callback(nullptr);
                 });

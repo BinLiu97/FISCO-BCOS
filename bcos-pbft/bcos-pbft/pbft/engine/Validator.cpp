@@ -40,7 +40,10 @@ void TxsValidator::verifyProposal(bcos::crypto::PublicPtr _fromNode,
         return;
     }
     // TODO: passing block directly, no need to createBlock twice
+    auto startTime = utcTime();
     m_txPool->asyncVerifyBlock(_fromNode, _proposal->data(), _verifyFinishedHandler);
+    PBFT_LOG(ERROR) << LOG_DESC("verifyProposal time cost")
+                      << LOG_KV("time", utcTime() - startTime);
 }
 
 void TxsValidator::asyncResetTxsFlag(bytesConstRef _data, bool _flag, bool _emptyTxBatchHash)

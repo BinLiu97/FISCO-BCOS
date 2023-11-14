@@ -184,6 +184,7 @@ protected:
     GraphKeyLocks::Ptr m_keyLocks = std::make_shared<GraphKeyLocks>();
 
     std::chrono::system_clock::time_point m_currentTimePoint;
+    int64_t m_batchBlockCommitTimePoint;
 
     std::chrono::milliseconds m_executeElapsed;
     std::chrono::milliseconds m_hashElapsed;
